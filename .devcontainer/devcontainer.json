@@ -1,0 +1,30 @@
+{
+  "name": "AzurePIMAccessAutomator",
+  "image": "mcr.microsoft.com/devcontainers/python:3.12",
+
+  "features": {
+    // Azure CLI — required for `az login` (the preferred auth path)
+    "ghcr.io/devcontainers/features/azure-cli:1": {
+      "version": "latest"
+    }
+  },
+
+  "postCreateCommand": "pip install --no-cache-dir -r requirements.txt",
+
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "ms-python.pylint",
+        "redhat.vscode-yaml"
+      ],
+      "settings": {
+        "python.defaultInterpreterPath": "/usr/local/bin/python",
+        "editor.formatOnSave": true,
+        "[python]": {
+          "editor.defaultFormatter": "ms-python.python"
+        }
+      }
+    }
+  }
+}

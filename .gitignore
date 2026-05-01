@@ -216,3 +216,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Azure PIM – personal role config (contains tenant/subscription/principal IDs)
+pim_roles.yaml

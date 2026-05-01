@@ -1,0 +1,55 @@
+# Azure PIM Role Activation Config — EXAMPLE
+# ---------------------------------------------------------------
+# Copy this file to pim_roles.yaml and fill in your own values.
+# pim_roles.yaml is git-ignored so your IDs stay off version control.
+# ---------------------------------------------------------------
+
+settings:
+  # Azure Active Directory tenant (Directory) ID
+  # az account show --query tenantId -o tsv
+  tenant_id: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+
+  # Azure Subscription ID
+  # az account show --query id -o tsv
+  subscription_id: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+
+  # Your user/service-principal Object ID in AAD
+  # az ad signed-in-user show --query id -o tsv
+  principal_id: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+
+  # ISO 8601 duration — how long each activation lasts
+  # PT1H = 1 hour, PT4H = 4 hours, PT8H = 8 hours (max is policy-dependent)
+  default_duration: "PT8H"
+
+  # Justification string shown in the Azure audit log
+  default_justification: "Daily work activation"
+
+  # Seconds to wait between activation requests (avoid rate-limiting)
+  delay_between_requests_seconds: 2
+
+roles:
+  # Each entry activates one eligible PIM role on one resource group.
+  # Set enabled: false to skip a role without deleting it.
+
+  # ── Contributor ──────────────────────────────────────────────
+  - resource: "my-resource-group-dev"
+    role: "Contributor"
+    resource_type: "ResourceGroup"   # only ResourceGroup is currently supported
+    enabled: true
+
+  - resource: "my-resource-group-test"
+    role: "Contributor"
+    resource_type: "ResourceGroup"
+    enabled: true
+
+  # ── Reader ───────────────────────────────────────────────────
+  - resource: "my-resource-group-dev"
+    role: "Reader"
+    resource_type: "ResourceGroup"
+    enabled: true
+
+  # ── User Access Administrator ────────────────────────────────
+  - resource: "my-resource-group-dev"
+    role: "User Access Administrator"
+    resource_type: "ResourceGroup"
+    enabled: false   # disabled — set to true to activate

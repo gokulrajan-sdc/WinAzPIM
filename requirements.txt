@@ -1,0 +1,3 @@
+azure-identity>=1.19
+pyyaml>=6.0
+requests>=2.32
