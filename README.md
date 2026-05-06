@@ -59,8 +59,8 @@ On launch the app will:
 
 | ✓ | Status | Role | Resource | Via | Until |
 |---|---|---|---|---|---|
-| ☑ | ACTIVE | Contributor | ft-core-data-services-dev | Group | 2026-05-06 18:00 (in 4h 12m) |
-| ☐ | eligible | Contributor | ft-applications-pat-dev | Group | 2026-06-30 14:18 (in 55d 3h) |
+| ☑ | ACTIVE | Contributor | my-platform-rg-dev | Group | 2026-05-06 18:00 (in 4h 12m) |
+| ☐ | eligible | Contributor | my-app-rg-dev | Group | 2026-06-30 14:18 (in 55d 3h) |
 
 3. The leftmost column is a checkbox — click anywhere in a row to toggle.
 4. Type a justification at the bottom, pick a duration (PT1H / PT2H / PT4H / PT8H), click **Activate selected**. The same justification is used for every ticked row. Already-active rows are skipped automatically.
@@ -85,10 +85,10 @@ Found 22 eligible PIM role(s) — 3 currently active:
 
   STATUS    ROLE         RESOURCE                          VIA    UNTIL
   --------------------------------------------------------------------------
-  ACTIVE    Contributor  ft-core-data-services-dev         Group  2026-05-06T18:00:00Z
-  ACTIVE    Contributor  ft-core-services-dev              Group  2026-05-06T18:00:00Z
-  ACTIVE    Reader       football_analytics_dataplatform   Group  2026-05-06T18:00:00Z
-  eligible  Contributor  ft-applications-pat-dev           Group  2026-06-30T14:18:51Z
+  ACTIVE    Contributor  my-platform-rg-dev                Group  2026-05-06T18:00:00Z
+  ACTIVE    Contributor  my-platform-rg-test               Group  2026-05-06T18:00:00Z
+  ACTIVE    Reader       my-analytics-rg-dev               Group  2026-05-06T18:00:00Z
+  eligible  Contributor  my-app-rg-dev                     Group  2026-06-30T14:18:51Z
   ...
 ```
 
@@ -106,7 +106,7 @@ Activate one eligibility with a custom justification and wait for Azure to confi
 ```
 python activate_pim_roles.py --activate \
     --role "Contributor" \
-    --resource "ft-applications-pat-dev" \
+    --resource "my-app-rg-dev" \
     --reason "investigating prod ticket #1234"
 ```
 
