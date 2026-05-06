@@ -3,34 +3,37 @@
 Azure PIM Role Activator — desktop UI
 
 Tk-based UI that:
-  1. Ensures the user is signed in via Azure CLI; offers to launch `az login` if not.
-  2. Loads every PIM eligibility (direct + group-inherited) and the matching active
-     assignments, displayed in a checkable, sortable table.
-  3. Lets the user tick multiple eligibilities and submit a single activation request
-     with a shared justification message.
+  1. Authenticates the user. Tries an existing `az login` session silently first;
+     if that fails, opens a system-browser sign-in via MSAL (no `az` CLI required).
+  2. Loads every PIM eligibility (direct + group-inherited) and the matching
+     active assignments, displayed in a checkable, sortable table.
+  3. Lets the user tick multiple eligibilities and submit a single activation
+     request with a shared justification message.
   4. Polls Azure every hour to keep STATUS / UNTIL columns fresh.
   5. Prompts re-login if the underlying credential expires.
 """
 
-import sys
+import base64
+import json
+import logging
 import threading
-import subprocess
 import tkinter as tk
 from tkinter import ttk, messagebox
 from datetime import datetime
 
 import requests
 from azure.core.exceptions import ClientAuthenticationError
-from azure.identity import AzureCliCredential, DefaultAzureCredential
+from azure.identity import AzureCliCredential, InteractiveBrowserCredential
 
 from activate_pim_roles import (
     ARM_SCOPE, GRAPH_SCOPE,
-    get_az_account, get_signed_in_user_id, get_my_group_ids,
+    get_signed_in_user_id, get_my_group_ids,
     list_eligible_roles, list_active_assignments,
     activate_role, wait_for_activation,
     _PIM_TERMINAL_OK,
 )
 
+log = logging.getLogger(__name__)
 
 REFRESH_INTERVAL_MS = 60 * 60 * 1000  # 1 hour
 ACTIVATION_TIMEOUT_S = 180
@@ -38,21 +41,45 @@ ACTIVATION_TIMEOUT_S = 180
 
 # ── Auth helpers ──────────────────────────────────────────────────────────────
 
-def is_logged_in() -> bool:
+def decode_tenant_from_token(token: str) -> str:
+    """Pull the 'tid' (tenant ID) claim out of a JWT access token.
+
+    Used so we can show the user which tenant they signed into without making
+    an extra `az account show` call (which wouldn't work in the packaged app).
+    """
     try:
-        get_az_account()
-        return True
-    except RuntimeError:
-        return False
+        _, payload_b64, _ = token.split(".", 2)
+        payload_b64 += "=" * (-len(payload_b64) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(payload_b64))
+        return payload.get("tid", "") or payload.get("tenant_id", "")
+    except Exception:
+        return ""
 
 
-def run_az_login(tenant_id: str | None = None) -> bool:
-    """Launch `az login` (opens a browser). Blocks until the CLI returns."""
-    cmd = ["az", "login"]
-    if tenant_id:
-        cmd += ["--tenant", tenant_id]
-    result = subprocess.run(cmd, shell=(sys.platform == "win32"))
-    return result.returncode == 0
+def acquire_credential_silent_then_browser(tenant_id: str | None = None):
+    """Return a usable TokenCredential.
+
+    First tries the existing `az login` session silently — gives SSO without
+    requiring user interaction if the user has the Azure CLI installed and
+    signed in. If that fails (no CLI, no session, expired refresh token, etc.),
+    falls back to the system-browser MSAL flow which works without any CLI.
+
+    Raises ClientAuthenticationError if both paths fail.
+    """
+    # 1. Silent — only succeeds if there is an active `az login` session
+    try:
+        cred = AzureCliCredential(tenant_id=tenant_id) if tenant_id else AzureCliCredential()
+        cred.get_token(ARM_SCOPE)
+        log.debug("Authenticated via existing Azure CLI session.")
+        return cred
+    except Exception as e:
+        log.debug("AzureCliCredential silent attempt failed: %s", e)
+
+    # 2. Interactive browser — opens system browser via MSAL
+    cred = InteractiveBrowserCredential(tenant_id=tenant_id) if tenant_id else InteractiveBrowserCredential()
+    cred.get_token(ARM_SCOPE)  # triggers the browser flow
+    log.debug("Authenticated via interactive browser.")
+    return cred
 
 
 # ── Formatting ────────────────────────────────────────────────────────────────
@@ -162,39 +189,42 @@ class PimApp:
 
     # --------------------------------------------------------------- Bootstrap
     def bootstrap(self):
-        if not is_logged_in():
-            ok = messagebox.askokcancel(
-                "Sign in to Azure",
-                "You're not signed in. Click OK to launch `az login` in your browser.",
-            )
-            if not ok:
-                self.root.destroy()
-                return
-            self.set_status("Waiting for `az login` to complete…")
-            self.root.update_idletasks()
-            if not run_az_login() or not is_logged_in():
-                messagebox.showerror("Sign-in failed", "Could not sign in via Azure CLI.")
-                self.root.destroy()
-                return
+        """Kick off authentication on a worker thread so the UI never freezes."""
+        self.set_status("Authenticating… (a browser window may open if needed)")
+        self.refresh_btn.config(state="disabled")
+        threading.Thread(target=self._auth_worker, args=(None,), daemon=True).start()
 
+    def _auth_worker(self, tenant_id: str | None):
+        """Acquire a credential, then hand off to the UI thread to start refreshing."""
         try:
-            account = get_az_account()
-        except RuntimeError as e:
-            messagebox.showerror("Azure CLI error", str(e))
-            self.root.destroy()
+            credential = acquire_credential_silent_then_browser(tenant_id=tenant_id)
+            arm_token = credential.get_token(ARM_SCOPE).token
+        except ClientAuthenticationError as e:
+            self.root.after(0, self._auth_failed, str(e))
             return
-        self.tenant_id = account["tenantId"]
-        self.tenant_lbl.config(
-            text=f"Tenant: {self.tenant_id}   |   Subscription: {account.get('name', '?')}"
-        )
+        except Exception as e:
+            self.root.after(0, self._auth_failed, f"Unexpected error during sign-in: {e}")
+            return
 
-        try:
-            self.credential = AzureCliCredential(tenant_id=self.tenant_id)
-            self.credential.get_token(ARM_SCOPE)
-        except ClientAuthenticationError:
-            self.credential = DefaultAzureCredential()
+        tid = tenant_id or decode_tenant_from_token(arm_token)
+        self.root.after(0, self._auth_done, credential, tid)
 
+    def _auth_done(self, credential, tenant_id: str):
+        self.credential = credential
+        self.tenant_id = tenant_id
+        self.tenant_lbl.config(text=f"Tenant: {tenant_id or '(unknown)'}")
+        self.set_status("Signed in. Loading roles…")
         self.refresh()
+
+    def _auth_failed(self, detail: str):
+        messagebox.showerror(
+            "Sign-in failed",
+            "Could not sign in to Azure.\n\n"
+            f"{detail}\n\n"
+            "Tip: if you have the Azure CLI installed, running `az login` in a "
+            "terminal first will let this app pick up your session silently.",
+        )
+        self.root.destroy()
 
     # ----------------------------------------------------------------- Refresh
     def refresh(self):
@@ -423,20 +453,11 @@ class PimApp:
         ):
             self.root.destroy()
             return
-        self.set_status("Re-authenticating…")
-        self.root.update_idletasks()
-        if not run_az_login(self.tenant_id):
-            messagebox.showerror("Sign-in failed", "Could not sign in via Azure CLI.")
-            self.root.destroy()
-            return
-        try:
-            self.credential = AzureCliCredential(tenant_id=self.tenant_id)
-            self.credential.get_token(ARM_SCOPE)
-        except Exception as e:
-            messagebox.showerror("Auth failed", str(e))
-            self.root.destroy()
-            return
-        self.refresh()
+        # Reuse the same silent-then-browser flow, pinning the same tenant
+        self.set_status("Re-authenticating… (a browser window may open if needed)")
+        threading.Thread(
+            target=self._auth_worker, args=(self.tenant_id,), daemon=True,
+        ).start()
 
     # ----------------------------------------------------------------- Helpers
     def set_status(self, text: str):

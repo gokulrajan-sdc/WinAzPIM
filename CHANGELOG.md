@@ -40,12 +40,30 @@ aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   can show whether each eligible role is currently active and when the
   current activation expires.
 - **`CHANGELOG.md`** — this file.
+- **Packaging** — `pim_activator.spec` (PyInstaller) plus `build.py`
+  produce a standalone, installable desktop app per OS:
+  - Windows: `AzurePIMActivator-windows.zip`
+  - macOS: `AzurePIMActivator-macos.dmg`
+  - Linux: `AzurePIMActivator-linux.tar.gz`
+- **`requirements-dev.txt`** pinning PyInstaller for build environments.
+- **GitHub Actions release workflow** (`.github/workflows/release.yml`) — builds
+  all three platform packages in a parallel matrix on tag push (`v*.*.*`) or
+  manual dispatch, then creates a GitHub Release with the three artifacts
+  attached. Pre-release tags (`-alpha`, `-beta`, `-rc`) are automatically
+  marked as pre-releases.
 
 ### Changed
 
 - **README** rewritten around the three workflows (Desktop UI / CLI list +
-  activate / batch YAML activation) with a platform-support matrix and
-  troubleshooting table.
+  activate / batch YAML activation) with a platform-support matrix, build
+  instructions, and troubleshooting table.
+- **Desktop UI auth flow** reworked. Authentication now runs on a worker
+  thread so the UI never freezes while signing in. The flow tries an
+  existing `az login` session silently first; on failure it falls back to
+  an `InteractiveBrowserCredential` (system-browser MSAL flow) which works
+  even when the Azure CLI isn't installed — required for the packaged
+  distributable to run on machines without `az`. The previous subprocess
+  call to `az login` from inside the UI was removed.
 - **Auth bootstrap** — `--list` and `--activate` no longer require
   `pim_roles.yaml`; tenant and subscription are read from the active
   `az account show` session. Batch activation still uses the YAML file.

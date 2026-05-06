@@ -54,7 +54,7 @@ python pim_ui.py
 
 On launch the app will:
 
-1. Check whether you're signed in via Azure CLI. If not, prompt you to launch `az login` (opens your browser).
+1. **Authenticate.** It first tries to reuse an existing `az login` session silently — no prompt if you already ran `az login`. If that fails (no Azure CLI installed, no active session, expired refresh token), it falls back to a system-browser sign-in via MSAL. This means **the packaged distributable works on machines without the Azure CLI**.
 2. Pull your eligibilities + active assignments and display them in a table:
 
 | ✓ | Status | Role | Resource | Via | Until |
@@ -213,6 +213,60 @@ The batch run prints progress as it goes and a final summary:
 `Skipped` means the role was already active or pending — not an error.
 
 > Note: the batch flow does **not** poll for activation completion (it just checks the PUT response code). Use `--activate` for single roles when you need to wait for the terminal status.
+
+## Building a standalone desktop app
+
+The desktop UI can be packaged into a self-contained executable so end users don't need a Python environment installed. PyInstaller is used; cross-compilation isn't supported, so you build on each target OS.
+
+```
+pip install -r requirements-dev.txt
+python build.py
+```
+
+`build.py` runs PyInstaller against [pim_activator.spec](pim_activator.spec) and then packages the result for the host platform:
+
+| Host | Output (in `artifacts/`) |
+|---|---|
+| Windows | `AzurePIMActivator-windows.zip` (contains `AzurePIMActivator.exe` + bundled runtime) |
+| macOS | `AzurePIMActivator-macos.dmg` (drag-to-Applications, `AzurePIMActivator.app` inside) |
+| Linux | `AzurePIMActivator-linux.tar.gz` (extract anywhere, run the `AzurePIMActivator` binary) |
+
+**Linux note:** PyInstaller bundles the Python interpreter but not Tk's shared libs from your distro by default. Make sure `python3-tk` is installed at *build time* — PyInstaller will then pull the necessary `libtk*.so` and `libtcl*.so` into the bundle. Recipients of the tarball don't need Tk installed on their own machines.
+
+**macOS note:** the produced `.app` is unsigned. Recipients will need to right-click → Open the first time (or run `xattr -cr AzurePIMActivator.app`) to bypass Gatekeeper. For a notarised build, sign with `codesign` and submit to Apple's notarisation service after `build.py` completes.
+
+If you want to run PyInstaller manually instead of using `build.py`:
+
+```
+pyinstaller --noconfirm pim_activator.spec
+```
+
+The output lands in `dist/`; package as you wish.
+
+## Releasing a new version
+
+Push a version tag and the [release workflow](.github/workflows/release.yml) does the rest:
+
+```bash
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+The workflow:
+
+1. **Runs in parallel** on `windows-latest`, `macos-latest` (Apple Silicon), and `ubuntu-latest`.
+2. Installs deps (`pip install -r requirements-dev.txt`) and runs `python build.py` on each runner.
+3. Uploads the three platform artifacts as workflow artifacts.
+4. Once all three succeed, the `release` job creates a **GitHub Release** named `v1.0.0` with auto-generated notes and attaches:
+   - `AzurePIMActivator-windows.zip`
+   - `AzurePIMActivator-macos.dmg`
+   - `AzurePIMActivator-linux.tar.gz`
+
+Pre-release tags (`v1.0.0-alpha.1`, `v1.0.0-beta.2`, `v1.0.0-rc.1`, etc.) are automatically marked as pre-releases on GitHub.
+
+If a build fails and you need to re-run without pushing a new tag, go to **Actions → Release → Run workflow** and supply the existing tag in the input field. The job will upload assets to the existing release (clobbering any previously uploaded files for that release).
+
+The workflow requires no secrets beyond the default `GITHUB_TOKEN` — no external credentials needed.
 
 ## How it discovers group-inherited eligibilities
 
