@@ -1,10 +1,9 @@
 # AzurePIMAccessAutomator
 
-CLI for working with Azure Privileged Identity Management (PIM) eligible role assignments without clicking through the portal. The script supports three workflows:
+Tools for working with Azure Privileged Identity Management (PIM) eligible role assignments without clicking through the portal. Two interfaces ship in this repo:
 
-1. **Batch activation** — define every role you want active in a YAML file and activate them all in one shot.
-2. **List** — show every PIM-eligible role you have (direct or inherited via AAD groups), with status (active vs eligible) and expiry.
-3. **Single activation** — activate one specific eligibility with a custom justification, polling until Azure reports a terminal status.
+- **Desktop UI** (`pim_ui.py`) — a Tk-based app that lists every PIM-eligible role you have (direct or inherited via AAD groups), shows current activation status, and lets you tick multiple roles and activate them with a single justification.
+- **CLI** (`activate_pim_roles.py`) — supports listing (`--list`), single-role activation with polling (`--activate`), and batch activation from a YAML file. Useful for scripting and "start of day" automation.
 
 ## Prerequisites
 
@@ -15,6 +14,18 @@ CLI for working with Azure Privileged Identity Management (PIM) eligible role as
 ```
 pip install -r requirements.txt
 ```
+
+## Platform support
+
+Both the CLI and the desktop UI run on Windows, macOS and Linux. The only platform-specific gotcha is Tk on Linux:
+
+| Platform | Notes |
+|---|---|
+| Windows | Works out of the box. `az` (which is `az.cmd`) is invoked through the shell internally. |
+| macOS | Works out of the box if you use Python from python.org or Homebrew (`brew install python-tk` if your Python doesn't already include Tk). |
+| Linux  | Tk is not bundled with the system Python on most distros. Install it before running the UI: <br>• Debian / Ubuntu: `sudo apt install python3-tk` <br>• Fedora / RHEL: `sudo dnf install python3-tkinter` <br>• Arch: `sudo pacman -S tk` |
+
+You can confirm Tk is available with `python -c "import tkinter; tkinter.Tk().destroy()"` — that should exit silently. The CLI flows (`--list`, `--activate`, batch) don't need Tk.
 
 ## Dev container (recommended)
 
@@ -35,7 +46,31 @@ The script prefers the existing `az login` session (`AzureCliCredential`). If th
 
 `--list` and `--activate` additionally call **Microsoft Graph** to resolve your group memberships (so group-inherited eligibilities show up). Your `az login` session needs the delegated permissions `User.Read` and `GroupMember.Read.All` — both granted by default for typical Azure CLI logins.
 
-## Usage
+## Desktop UI
+
+```
+python pim_ui.py
+```
+
+On launch the app will:
+
+1. Check whether you're signed in via Azure CLI. If not, prompt you to launch `az login` (opens your browser).
+2. Pull your eligibilities + active assignments and display them in a table:
+
+| ✓ | Status | Role | Resource | Via | Until |
+|---|---|---|---|---|---|
+| ☑ | ACTIVE | Contributor | ft-core-data-services-dev | Group | 2026-05-06 18:00 (in 4h 12m) |
+| ☐ | eligible | Contributor | ft-applications-pat-dev | Group | 2026-06-30 14:18 (in 55d 3h) |
+
+3. The leftmost column is a checkbox — click anywhere in a row to toggle.
+4. Type a justification at the bottom, pick a duration (PT1H / PT2H / PT4H / PT8H), click **Activate selected**. The same justification is used for every ticked row. Already-active rows are skipped automatically.
+5. While each request is in flight its row shows `submitting`. When the worker finishes, the table re-fetches so STATUS / UNTIL reflect the latest state.
+6. The app auto-refreshes every hour. Click **Refresh now** to pull on demand.
+7. If the Azure session expires (401 from ARM, or `AzureCliCredential` fails), a modal asks you to re-run `az login`.
+
+The status bar at the bottom always shows the most recent message (loading, refresh complete, errors).
+
+## CLI
 
 ### List eligible roles
 
