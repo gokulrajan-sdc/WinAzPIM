@@ -14,9 +14,12 @@ Authentication:
 """
 
 import sys
+import json
 import time
 import uuid
+import argparse
 import logging
+import subprocess
 from pathlib import Path
 from urllib.parse import quote
 
@@ -37,6 +40,9 @@ ARM_SCOPE   = "https://management.azure.com/.default"
 ARM_BASE    = "https://management.azure.com"
 API_VERSION = "2020-10-01"
 
+GRAPH_SCOPE = "https://graph.microsoft.com/.default"
+GRAPH_BASE  = "https://graph.microsoft.com/v1.0"
+
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -52,6 +58,20 @@ def load_config(path: str = "pim_roles.yaml") -> dict:
 def get_token(credential) -> str:
     token = credential.get_token(ARM_SCOPE)
     return token.token
+
+
+def get_az_account() -> dict:
+    """Return the active `az account show` payload (tenantId, id, user, ...)."""
+    result = subprocess.run(
+        ["az", "account", "show", "-o", "json"],
+        capture_output=True, text=True, shell=(sys.platform == "win32"),
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            "Could not read active Azure subscription via `az account show`. "
+            "Run `az login` first.\n" + result.stderr.strip()
+        )
+    return json.loads(result.stdout)
 
 
 def build_rg_scope(subscription_id: str, resource_group: str) -> str:
@@ -77,6 +97,121 @@ def list_role_definitions(
     return data[0]["id"]  # full ARM id, e.g. /subscriptions/.../roleDefinitions/<guid>
 
 
+def get_signed_in_user_id(graph_token: str) -> str:
+    """Return the AAD object ID of the signed-in user via Microsoft Graph."""
+    resp = requests.get(
+        f"{GRAPH_BASE}/me?$select=id",
+        headers={"Authorization": f"Bearer {graph_token}"},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return resp.json()["id"]
+
+
+def get_my_group_ids(graph_token: str) -> list[str]:
+    """Return AAD object IDs of every group the signed-in user belongs to (transitively)."""
+    ids: list[str] = []
+    url = f"{GRAPH_BASE}/me/transitiveMemberOf?$select=id&$top=999"
+    headers = {"Authorization": f"Bearer {graph_token}"}
+    while url:
+        resp = requests.get(url, headers=headers, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        ids.extend(item["id"] for item in data.get("value", []) if "id" in item)
+        url = data.get("@odata.nextLink")
+    return ids
+
+
+def _list_pim_instances(
+    arm_token: str, resource_path: str, principal_ids: list[str]
+) -> list[dict]:
+    """Generic tenant-root PIM listing for either eligibility or active-assignment instances.
+
+    `resource_path` is e.g. "roleEligibilityScheduleInstances" or
+    "roleAssignmentScheduleInstances". Queries asTarget() for the user plus
+    `principalId eq` for each group, deduping by instance id.
+    """
+    seen: set[str] = set()
+    out: list[dict] = []
+    url = f"{ARM_BASE}/providers/Microsoft.Authorization/{resource_path}"
+    headers = {"Authorization": f"Bearer {arm_token}"}
+
+    queries = [("asTarget()", "signed-in user")]
+    queries += [(f"principalId eq '{pid}'", f"group {pid}") for pid in principal_ids]
+
+    for filt, label in queries:
+        params = {"api-version": API_VERSION, "$filter": filt}
+        try:
+            resp = requests.get(url, headers=headers, params=params, timeout=30)
+            resp.raise_for_status()
+        except requests.HTTPError as e:
+            log.debug("Skipping %s on %s: %s", label, resource_path, e)
+            continue
+        items = resp.json().get("value", [])
+        log.debug("  %-22s %s → %d", resource_path, label, len(items))
+        for item in items:
+            key = item.get("id") or item.get("name")
+            if key and key not in seen:
+                seen.add(key)
+                out.append(item)
+    return out
+
+
+def list_eligible_roles(arm_token: str, principal_ids: list[str]) -> list[dict]:
+    return _list_pim_instances(arm_token, "roleEligibilityScheduleInstances", principal_ids)
+
+
+def list_active_assignments(arm_token: str, principal_ids: list[str]) -> list[dict]:
+    return _list_pim_instances(arm_token, "roleAssignmentScheduleInstances", principal_ids)
+
+
+def print_eligible_roles(eligibilities: list[dict], actives: list[dict]) -> None:
+    """Pretty-print the eligible role list, marking which ones are currently activated."""
+    if not eligibilities:
+        print("No eligible PIM roles found for this principal.")
+        return
+
+    # An active assignment links back to the eligibility schedule it was activated from.
+    # Map: eligibilityScheduleId -> active endDateTime (when the activation expires).
+    active_until: dict[str, str] = {}
+    for a in actives:
+        props = a.get("properties", {})
+        link = props.get("linkedRoleEligibilityScheduleId")
+        if link:
+            active_until[link] = props.get("endDateTime") or ""
+
+    rows = []
+    for r in eligibilities:
+        props = r.get("properties", {})
+        ep = props.get("expandedProperties", {})
+        principal_type = ep.get("principal", {}).get("type", "")
+        sched_id = props.get("roleEligibilityScheduleId")
+        is_active = sched_id in active_until
+        rows.append({
+            "role":   ep.get("roleDefinition", {}).get("displayName", "?"),
+            "scope":  ep.get("scope", {}).get("displayName", props.get("scope", "?")),
+            "via":    "Group" if principal_type == "Group" else "Direct",
+            "status": "ACTIVE" if is_active else "eligible",
+            "until":  active_until[sched_id] if is_active else (props.get("endDateTime") or "permanent"),
+        })
+
+    rows.sort(key=lambda r: (r["status"] != "ACTIVE", r["role"], r["scope"]))
+
+    role_w   = max(len(r["role"])   for r in rows + [{"role":   "ROLE"}])
+    scope_w  = max(len(r["scope"])  for r in rows + [{"scope":  "RESOURCE"}])
+    via_w    = max(len(r["via"])    for r in rows + [{"via":    "VIA"}])
+    status_w = max(len(r["status"]) for r in rows + [{"status": "STATUS"}])
+
+    active_count = sum(1 for r in rows if r["status"] == "ACTIVE")
+    print(f"\nFound {len(rows)} eligible PIM role(s) — {active_count} currently active:\n")
+    header = f"  {'STATUS':<{status_w}}  {'ROLE':<{role_w}}  {'RESOURCE':<{scope_w}}  {'VIA':<{via_w}}  UNTIL"
+    print(header)
+    print("  " + "-" * (len(header) - 2))
+    for r in rows:
+        print(f"  {r['status']:<{status_w}}  {r['role']:<{role_w}}  {r['scope']:<{scope_w}}  {r['via']:<{via_w}}  {r['until']}")
+    print()
+
+
 def activate_role(
     token: str,
     scope: str,
@@ -84,8 +219,8 @@ def activate_role(
     principal_id: str,
     duration: str,
     justification: str,
-) -> requests.Response:
-    """Submit a PIM self-activation request."""
+) -> tuple[requests.Response, str]:
+    """Submit a PIM self-activation request. Returns (response, request_url)."""
     request_id = str(uuid.uuid4())
     url = (
         f"{ARM_BASE}{scope}/providers/Microsoft.Authorization"
@@ -112,12 +247,192 @@ def activate_role(
         }
     }
     resp = requests.put(url, headers=headers, json=body, timeout=30)
-    return resp
+    return resp, url
+
+
+# Terminal statuses on a roleAssignmentScheduleRequest, per Azure PIM docs.
+_PIM_TERMINAL_OK    = {"Provisioned", "Granted", "AdminApproved"}
+_PIM_TERMINAL_FAIL  = {"Failed", "Denied", "Canceled", "AdminDenied", "TimedOut", "Revoked"}
+
+
+def wait_for_activation(
+    token: str, request_url: str, timeout_s: int = 120, interval_s: float = 3.0
+) -> tuple[str, dict]:
+    """Poll a roleAssignmentScheduleRequests URL until it reaches a terminal status.
+
+    Returns (status, last_payload). Raises TimeoutError if no terminal status within timeout.
+    """
+    headers = {"Authorization": f"Bearer {token}"}
+    deadline = time.monotonic() + timeout_s
+    last_status = ""
+    while time.monotonic() < deadline:
+        resp = requests.get(request_url, headers=headers, timeout=30)
+        resp.raise_for_status()
+        payload = resp.json()
+        status = payload.get("properties", {}).get("status", "")
+        if status != last_status:
+            log.info("  status: %s", status or "<pending>")
+            last_status = status
+        if status in _PIM_TERMINAL_OK or status in _PIM_TERMINAL_FAIL:
+            return status, payload
+        time.sleep(interval_s)
+    raise TimeoutError(f"Activation did not reach a terminal status within {timeout_s}s (last: {last_status!r})")
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def main():
+    parser = argparse.ArgumentParser(description="Activate or list Azure PIM eligible roles.")
+    parser.add_argument(
+        "--list",
+        action="store_true",
+        help="List eligible PIM roles for the signed-in user and exit (no activation).",
+    )
+    parser.add_argument(
+        "-v", "--verbose",
+        action="store_true",
+        help="Enable debug logging (per-principal eligibility counts, etc.).",
+    )
+    parser.add_argument(
+        "--activate",
+        action="store_true",
+        help="Activate a single eligibility identified by --role and --resource.",
+    )
+    parser.add_argument("--role",     help="Role name (e.g. 'Contributor'). Used with --activate.")
+    parser.add_argument("--resource", help="Resource (e.g. resource-group name). Used with --activate.")
+    parser.add_argument("--reason",   help="Justification text for the activation. Used with --activate.")
+    parser.add_argument("--duration", default="PT8H", help="ISO-8601 duration (default PT8H).")
+    parser.add_argument("--no-wait",  action="store_true",
+                        help="Don't poll for completion — submit and return immediately.")
+    parser.add_argument("--timeout",  type=int, default=120,
+                        help="Seconds to wait for activation to reach a terminal status (default 120).")
+    args = parser.parse_args()
+    if args.verbose:
+        log.setLevel(logging.DEBUG)
+
+    # --list mode: no YAML required — read tenant from the active az session
+    if args.list:
+        try:
+            account = get_az_account()
+        except RuntimeError as exc:
+            log.error(str(exc))
+            sys.exit(1)
+        tenant_id = account["tenantId"]
+        log.info("Tenant: %s  (active subscription: %s)", tenant_id, account.get("name", "?"))
+
+        try:
+            credential = AzureCliCredential(tenant_id=tenant_id)
+            arm_token   = credential.get_token(ARM_SCOPE).token
+            graph_token = credential.get_token(GRAPH_SCOPE).token
+        except Exception as exc:
+            log.debug("AzureCliCredential failed (%s); trying DefaultAzureCredential.", exc)
+            credential = DefaultAzureCredential()
+            arm_token   = credential.get_token(ARM_SCOPE).token
+            graph_token = credential.get_token(GRAPH_SCOPE).token
+
+        group_ids = get_my_group_ids(graph_token)
+        log.info("Resolved %d group membership(s); querying PIM eligibilities tenant-wide...", len(group_ids))
+
+        eligible = list_eligible_roles(arm_token, group_ids)
+        active   = list_active_assignments(arm_token, group_ids)
+        print_eligible_roles(eligible, active)
+        return
+
+    # --activate mode: pick one eligibility from the live list and submit it
+    if args.activate:
+        missing = [n for n, v in [("--role", args.role), ("--resource", args.resource), ("--reason", args.reason)] if not v]
+        if missing:
+            log.error("--activate requires: %s", ", ".join(missing))
+            sys.exit(2)
+
+        try:
+            account = get_az_account()
+        except RuntimeError as exc:
+            log.error(str(exc))
+            sys.exit(1)
+        tenant_id = account["tenantId"]
+        log.info("Tenant: %s", tenant_id)
+
+        try:
+            credential = AzureCliCredential(tenant_id=tenant_id)
+            arm_token   = credential.get_token(ARM_SCOPE).token
+            graph_token = credential.get_token(GRAPH_SCOPE).token
+        except Exception as exc:
+            log.debug("AzureCliCredential failed (%s); trying DefaultAzureCredential.", exc)
+            credential = DefaultAzureCredential()
+            arm_token   = credential.get_token(ARM_SCOPE).token
+            graph_token = credential.get_token(GRAPH_SCOPE).token
+
+        user_id   = get_signed_in_user_id(graph_token)
+        group_ids = get_my_group_ids(graph_token)
+        eligibilities = list_eligible_roles(arm_token, group_ids)
+
+        # Match on role + resource displayName (case-insensitive)
+        want_role     = args.role.casefold()
+        want_resource = args.resource.casefold()
+        matches = []
+        for r in eligibilities:
+            ep = r.get("properties", {}).get("expandedProperties", {})
+            role_name = ep.get("roleDefinition", {}).get("displayName", "")
+            scope_name = ep.get("scope", {}).get("displayName", "")
+            if role_name.casefold() == want_role and scope_name.casefold() == want_resource:
+                matches.append(r)
+
+        if not matches:
+            log.error("No eligibility found matching role=%r resource=%r. Run --list to see available entries.",
+                      args.role, args.resource)
+            sys.exit(1)
+        if len(matches) > 1:
+            log.error("Ambiguous: %d eligibilities match role=%r resource=%r.", len(matches), args.role, args.resource)
+            sys.exit(1)
+
+        elig = matches[0]
+        props = elig["properties"]
+        scope = props["scope"]
+        role_def_id = props["roleDefinitionId"]
+        log.info("Activating %s @ %s for %s ...", args.role, args.resource, args.duration)
+        log.info("  scope: %s", scope)
+        log.info("  reason: %s", args.reason)
+
+        try:
+            resp, request_url = activate_role(
+                arm_token, scope, role_def_id, user_id, args.duration, args.reason
+            )
+        except requests.RequestException as e:
+            log.error("Request failed: %s", e)
+            sys.exit(1)
+
+        if resp.status_code not in (200, 201):
+            try:
+                detail = resp.json().get("error", {}).get("message", resp.text[:300])
+            except ValueError:
+                detail = resp.text[:300]
+            log.error("Activation request rejected (%d): %s", resp.status_code, detail)
+            sys.exit(1)
+
+        log.info("Request accepted (HTTP %d).", resp.status_code)
+
+        if args.no_wait:
+            print(f"\nRequest submitted. Track it at:\n  {request_url}")
+            return
+
+        try:
+            status, payload = wait_for_activation(arm_token, request_url, timeout_s=args.timeout)
+        except TimeoutError as e:
+            log.error(str(e))
+            sys.exit(1)
+
+        if status in _PIM_TERMINAL_OK:
+            end_time = payload.get("properties", {}).get("scheduleInfo", {}).get("expiration", {})
+            log.info("✓ Activated. Final status: %s", status)
+            print(f"\n  ✓  {args.role} @ {args.resource} is now active (status={status}).")
+            return
+        else:
+            err = payload.get("properties", {}).get("status", status)
+            msg = payload.get("properties", {}).get("statusDetail") or payload.get("properties", {}).get("justification", "")
+            log.error("✗ Activation did not succeed. Final status: %s. %s", err, msg)
+            sys.exit(1)
+
     config   = load_config()
     settings = config["settings"]
     roles    = config["roles"]
@@ -176,7 +491,7 @@ def main():
 
         # Submit activation
         try:
-            resp = activate_role(
+            resp, _ = activate_role(
                 token, scope, role_def_id, principal_id, duration, justification
             )
             if resp.status_code in (200, 201):
