@@ -25,9 +25,11 @@ from tkinter import ttk, messagebox, simpledialog
 from datetime import datetime
 from typing import Optional
 
+import webbrowser
+
 import requests
 from azure.core.exceptions import ClientAuthenticationError
-from azure.identity import AzureCliCredential, InteractiveBrowserCredential
+from azure.identity import AzureCliCredential, DeviceCodeCredential
 import customtkinter as ctk
 
 from activate_pim_roles import (
@@ -127,13 +129,22 @@ _PALETTE = {
 # ── Azure helpers (UI layer) ──────────────────────────────────────────────────
 
 def list_az_subscriptions() -> list:
-    """Return enabled subscriptions from `az account list --all`."""
+    """Return enabled subscriptions from `az account list --all`.
+
+    On Windows, az.cmd lives in the shell PATH but is not a standalone
+    executable, so we route through cmd /c (matching AzureCliCredential's
+    own approach) instead of invoking az directly.
+    """
     kwargs: dict = dict(capture_output=True, text=True)
     if sys.platform == "win32":
+        cmd = ["cmd", "/c", "az account list --output json --all"]
         kwargs["creationflags"] = _WIN_NO_WINDOW
-    result = subprocess.run(
-        ["az", "account", "list", "--output", "json", "--all"], **kwargs
-    )
+    else:
+        cmd = ["az", "account", "list", "--output", "json", "--all"]
+    try:
+        result = subprocess.run(cmd, **kwargs)
+    except FileNotFoundError:
+        return []
     if result.returncode != 0:
         return []
     try:
@@ -143,23 +154,214 @@ def list_az_subscriptions() -> list:
         return []
 
 
-def acquire_credential(tenant_id: Optional[str] = None):
-    """Try AzureCliCredential silently; fall back to interactive browser."""
-    try:
-        cred = (
-            AzureCliCredential(tenant_id=tenant_id) if tenant_id
-            else AzureCliCredential()
-        )
-        cred.get_token(ARM_SCOPE)
-        return cred
-    except Exception:
-        pass
+def _try_cli_credential(tenant_id: Optional[str]):
+    """Return an AzureCliCredential if the existing `az login` session is valid."""
     cred = (
-        InteractiveBrowserCredential(tenant_id=tenant_id) if tenant_id
-        else InteractiveBrowserCredential()
+        AzureCliCredential(tenant_id=tenant_id) if tenant_id
+        else AzureCliCredential()
     )
-    cred.get_token(ARM_SCOPE)
+    cred.get_token(ARM_SCOPE)   # raises if no valid session
     return cred
+
+
+# ── In-app device-code login dialog ──────────────────────────────────────────
+
+class _LoginDialog(ctk.CTkToplevel):
+    """Modal dialog that guides the user through the device-code auth flow.
+
+    Lifecycle
+    ---------
+    1. Created by `PimApp._device_code_auth()` on the main thread.
+    2. `show_code()` is called (main thread) once the device flow starts —
+       displays the URL, code, and countdown.
+    3. `close_success()` is called (main thread) once the background auth
+       thread obtains a token — closes the dialog silently.
+    4. If the user presses Cancel, `self.cancelled` is set to True; the
+       background thread will detect this and abort.
+    """
+
+    def __init__(self, parent: ctk.CTk, P: dict):
+        super().__init__(parent)
+        self.title("Sign in to Azure")
+        self.geometry("500x380")
+        self.resizable(False, False)
+        self.lift()
+        self.focus_force()
+        self.grab_set()
+
+        self.cancelled = False
+        self._P = P
+        self._countdown_job = None
+
+        self.configure(fg_color=P["surface"])
+        self._build_loading_state(P)
+        self.protocol("WM_DELETE_WINDOW", self._on_cancel)
+
+    # ── Phase 1: loading state ─────────────────────────────────────────────
+
+    def _build_loading_state(self, P: dict):
+        self._loading_frame = ctk.CTkFrame(self, fg_color="transparent")
+        self._loading_frame.place(relx=0.5, rely=0.5, anchor="center")
+
+        ctk.CTkLabel(
+            self._loading_frame,
+            text="Starting sign-in flow…",
+            font=ctk.CTkFont(size=14),
+            text_color=P["text_secondary"],
+        ).pack()
+
+        self._spin_bar = ttk.Progressbar(
+            self._loading_frame, mode="indeterminate", length=220
+        )
+        self._spin_bar.pack(pady=(14, 0))
+        self._spin_bar.start(10)
+
+    # ── Phase 2: show device code ──────────────────────────────────────────
+
+    def show_code(self, verification_uri: str, user_code: str, expires_on: datetime):
+        """Transition from loading state to the code-display state."""
+        self._spin_bar.stop()
+        self._loading_frame.place_forget()
+
+        P = self._P
+        self._expires_on = expires_on
+
+        pad = {"padx": 32}
+
+        # Title
+        ctk.CTkLabel(
+            self, text="Sign in to Azure",
+            font=ctk.CTkFont(size=16, weight="bold"),
+            text_color=P["text_primary"],
+        ).pack(pady=(28, 4), **pad, anchor="w")
+
+        ctk.CTkLabel(
+            self, text="Open your browser, go to the URL below, and enter the code.",
+            font=ctk.CTkFont(size=12),
+            text_color=P["text_secondary"],
+        ).pack(**pad, anchor="w")
+
+        # URL
+        ctk.CTkLabel(
+            self, text="Sign-in URL",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            text_color=P["text_muted"],
+        ).pack(pady=(18, 3), **pad, anchor="w")
+
+        url_frame = ctk.CTkFrame(
+            self, fg_color=P["surface2"],
+            border_width=1, border_color=P["border"], corner_radius=6,
+        )
+        url_frame.pack(fill="x", **pad)
+        ctk.CTkLabel(
+            url_frame, text=verification_uri,
+            font=ctk.CTkFont(size=12),
+            text_color=P["accent_blue"],
+        ).pack(side="left", padx=10, pady=8)
+
+        # Code
+        ctk.CTkLabel(
+            self, text="Your code",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            text_color=P["text_muted"],
+        ).pack(pady=(14, 3), **pad, anchor="w")
+
+        code_frame = ctk.CTkFrame(
+            self, fg_color=P["surface2"],
+            border_width=1, border_color=P["border"], corner_radius=6,
+        )
+        code_frame.pack(fill="x", **pad)
+        ctk.CTkLabel(
+            code_frame, text=user_code,
+            font=ctk.CTkFont(size=26, weight="bold"),
+            text_color=P["text_primary"],
+        ).pack(side="left", padx=16, pady=10)
+
+        # Buttons row
+        btn_frame = ctk.CTkFrame(self, fg_color="transparent")
+        btn_frame.pack(fill="x", **pad, pady=(14, 0))
+
+        ctk.CTkButton(
+            btn_frame, text="Copy code",
+            width=130, height=34,
+            fg_color=P["surface2"], border_width=1, border_color=P["border"],
+            text_color=P["text_primary"], hover_color=P["border"],
+            font=ctk.CTkFont(size=12),
+            command=lambda: self._copy_and_open(user_code, verification_uri, open_browser=False),
+        ).pack(side="left", padx=(0, 8))
+
+        ctk.CTkButton(
+            btn_frame, text="Copy code & open browser",
+            width=200, height=34,
+            fg_color=P["accent_blue"], hover_color="#388BFD",
+            text_color="#FFFFFF",
+            font=ctk.CTkFont(size=12),
+            command=lambda: self._copy_and_open(user_code, verification_uri, open_browser=True),
+        ).pack(side="left")
+
+        # Status row
+        status_row = ctk.CTkFrame(self, fg_color="transparent")
+        status_row.pack(fill="x", **pad, pady=(14, 0))
+
+        self._status_lbl = ctk.CTkLabel(
+            status_row, text="⟳  Waiting for sign-in…",
+            font=ctk.CTkFont(size=12),
+            text_color=P["text_secondary"],
+        )
+        self._status_lbl.pack(side="left")
+
+        self._countdown_lbl = ctk.CTkLabel(
+            status_row, text="",
+            font=ctk.CTkFont(size=11),
+            text_color=P["text_muted"],
+        )
+        self._countdown_lbl.pack(side="right")
+
+        # Cancel
+        ctk.CTkButton(
+            self, text="Cancel",
+            width=90, height=30,
+            fg_color="transparent", border_width=1, border_color=P["border"],
+            text_color=P["text_muted"], hover_color=P["surface2"],
+            font=ctk.CTkFont(size=11),
+            command=self._on_cancel,
+        ).pack(pady=(12, 20))
+
+        self._tick_countdown()
+
+    # ── Helpers ────────────────────────────────────────────────────────────
+
+    def _copy_and_open(self, code: str, uri: str, open_browser: bool):
+        self.clipboard_clear()
+        self.clipboard_append(code)
+        if open_browser:
+            webbrowser.open(uri)
+
+    def _tick_countdown(self):
+        try:
+            remaining = int((self._expires_on - datetime.now(self._expires_on.tzinfo)).total_seconds())
+        except Exception:
+            return
+        if remaining <= 0:
+            self._countdown_lbl.configure(text="Code expired")
+            self._status_lbl.configure(text="Code expired — please restart sign-in")
+            return
+        m, s = divmod(remaining, 60)
+        self._countdown_lbl.configure(text=f"Expires in {m}:{s:02d}")
+        self._countdown_job = self.after(1000, self._tick_countdown)
+
+    def close_success(self):
+        if self._countdown_job:
+            self.after_cancel(self._countdown_job)
+        self.grab_release()
+        self.destroy()
+
+    def _on_cancel(self):
+        self.cancelled = True
+        if self._countdown_job:
+            self.after_cancel(self._countdown_job)
+        self.grab_release()
+        self.destroy()
 
 
 def decode_tenant_from_token(token: str) -> str:
@@ -622,14 +824,22 @@ class PimApp:
 
     def bootstrap(self):
         self._show_loading("Connecting to Azure CLI…")
-        self.set_status("Authenticating… (a browser window may open if needed)")
+        self.set_status("Authenticating silently via Azure CLI…")
         threading.Thread(target=self._auth_worker, args=(None,), daemon=True).start()
 
     def _auth_worker(self, tenant_id: Optional[str]):
         """Background: authenticate + fetch subscriptions + resolve identity."""
         try:
             self._update_loading("Signing in to Azure…")
-            credential = acquire_credential(tenant_id)
+            # 1. Try existing az-login session silently
+            try:
+                credential = _try_cli_credential(tenant_id)
+            except Exception:
+                # 2. No CLI session — show the in-app device-code dialog
+                credential = self._device_code_auth(tenant_id)
+                if credential is None:
+                    return  # user cancelled; _auth_failed already called
+
             arm_token = credential.get_token(ARM_SCOPE).token
             tid = tenant_id or decode_tenant_from_token(arm_token)
 
@@ -663,6 +873,63 @@ class PimApp:
         self.root.after(
             0, self._auth_done, credential, tid, subscriptions, user_id, user_name
         )
+
+    def _device_code_auth(self, tenant_id: Optional[str]):
+        """Show an in-app device-code dialog and return a DeviceCodeCredential.
+
+        Called from the background auth thread. Schedules the dialog onto the
+        main thread via root.after(), then blocks waiting for either success
+        (token acquired) or cancellation (user closed the dialog).
+        """
+        dialog_ref: list = [None]
+        dialog_ready = threading.Event()
+        cancelled = threading.Event()
+
+        def _show_dialog():
+            dlg = _LoginDialog(self.root, self._p())
+            dialog_ref[0] = dlg
+            dialog_ready.set()
+
+        self.root.after(0, _show_dialog)
+        dialog_ready.wait(timeout=10)
+
+        self._update_loading("Waiting for sign-in…")
+        self.root.after(0, lambda: self.set_status(
+            "Sign-in required — complete the steps in the dialog."
+        ))
+
+        def _prompt_cb(verification_uri: str, user_code: str, expires_on):
+            def _update():
+                dlg = dialog_ref[0]
+                if dlg and not dlg.cancelled:
+                    dlg.show_code(verification_uri, user_code, expires_on)
+            self.root.after(0, _update)
+
+        try:
+            cred = DeviceCodeCredential(
+                tenant_id=tenant_id or "organizations",
+                prompt_callback=_prompt_cb,
+            )
+            # Blocks here — DeviceCodeCredential polls until the user signs in
+            # or the device code expires (~15 min by default).
+            cred.get_token(ARM_SCOPE)
+
+            # Auth succeeded — close the dialog cleanly
+            def _close():
+                dlg = dialog_ref[0]
+                if dlg and not dlg.cancelled:
+                    dlg.close_success()
+            self.root.after(0, _close)
+            return cred
+
+        except Exception as e:
+            dlg = dialog_ref[0]
+            if dlg and dlg.cancelled:
+                # User clicked Cancel — treat as graceful exit
+                self.root.after(0, self._auth_failed, "Sign-in was cancelled.")
+            else:
+                self.root.after(0, self._auth_failed, str(e))
+            return None
 
     def _auth_done(self, credential, tenant_id: str,
                    subscriptions: list, user_id: str, user_name: str):

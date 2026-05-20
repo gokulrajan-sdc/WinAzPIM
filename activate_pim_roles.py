@@ -67,8 +67,11 @@ def get_az_account() -> dict:
     """Return the active `az account show` payload (tenantId, id, user, ...)."""
     kwargs: dict = dict(capture_output=True, text=True)
     if sys.platform == "win32":
+        cmd = ["cmd", "/c", "az account show -o json"]
         kwargs["creationflags"] = _WIN_NO_WINDOW
-    result = subprocess.run(["az", "account", "show", "-o", "json"], **kwargs)
+    else:
+        cmd = ["az", "account", "show", "-o", "json"]
+    result = subprocess.run(cmd, **kwargs)
     if result.returncode != 0:
         raise RuntimeError(
             "Could not read active Azure subscription via `az account show`. "
