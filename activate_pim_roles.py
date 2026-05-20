@@ -60,12 +60,15 @@ def get_token(credential) -> str:
     return token.token
 
 
+_WIN_NO_WINDOW = 0x08000000
+
+
 def get_az_account() -> dict:
     """Return the active `az account show` payload (tenantId, id, user, ...)."""
-    result = subprocess.run(
-        ["az", "account", "show", "-o", "json"],
-        capture_output=True, text=True, shell=(sys.platform == "win32"),
-    )
+    kwargs: dict = dict(capture_output=True, text=True)
+    if sys.platform == "win32":
+        kwargs["creationflags"] = _WIN_NO_WINDOW
+    result = subprocess.run(["az", "account", "show", "-o", "json"], **kwargs)
     if result.returncode != 0:
         raise RuntimeError(
             "Could not read active Azure subscription via `az account show`. "
@@ -248,6 +251,35 @@ def activate_role(
     }
     resp = requests.put(url, headers=headers, json=body, timeout=30)
     return resp, url
+
+
+def deactivate_role(
+    token: str,
+    scope: str,
+    role_definition_id: str,
+    principal_id: str,
+    assignment_schedule_id: str,
+) -> requests.Response:
+    """Submit a PIM self-deactivation request."""
+    request_id = str(uuid.uuid4())
+    url = (
+        f"{ARM_BASE}{scope}/providers/Microsoft.Authorization"
+        f"/roleAssignmentScheduleRequests/{request_id}"
+        f"?api-version={API_VERSION}"
+    )
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+    body = {
+        "properties": {
+            "principalId": principal_id,
+            "roleDefinitionId": role_definition_id,
+            "requestType": "SelfDeactivate",
+            "linkedRoleAssignmentScheduleId": assignment_schedule_id,
+        }
+    }
+    return requests.put(url, headers=headers, json=body, timeout=30)
 
 
 # Terminal statuses on a roleAssignmentScheduleRequest, per Azure PIM docs.
