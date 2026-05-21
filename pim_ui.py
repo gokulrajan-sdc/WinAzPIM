@@ -20,12 +20,24 @@ import re
 import subprocess
 import sys
 import threading
+import time
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog
 from datetime import datetime
 from typing import Optional
 
 import webbrowser
+
+# Suppress CMD flash on Windows: azure-identity and msal call `az` via subprocess
+# without CREATE_NO_WINDOW, causing a console window to blink at startup.
+if sys.platform == "win32":
+    _CREATE_NO_WINDOW = 0x08000000
+    _orig_Popen_init = subprocess.Popen.__init__
+    def _popen_no_window(self, *args, **kwargs):
+        kwargs.setdefault("creationflags", 0)
+        kwargs["creationflags"] |= _CREATE_NO_WINDOW
+        _orig_Popen_init(self, *args, **kwargs)
+    subprocess.Popen.__init__ = _popen_no_window
 
 import requests
 from azure.core.exceptions import ClientAuthenticationError
@@ -43,8 +55,9 @@ from activate_pim_roles import (
 
 log = logging.getLogger(__name__)
 
-REFRESH_INTERVAL_MS = 60 * 60 * 1000
+REFRESH_INTERVAL_MS  = 60 * 60 * 1000
 ACTIVATION_TIMEOUT_S = 180
+_GROUP_CACHE_TTL     = 900   # seconds — group memberships rarely change
 
 # ── ISO normalization (Python ≤3.10 fromisoformat sub-second bug) ─────────────
 _SUB_SEC = re.compile(r'\.\d+')
@@ -392,6 +405,7 @@ class PimApp:
         self.row_data: dict = {}
         self.checked: dict = {}
         self.auto_renew_data: dict = {}       # iid -> justification str
+        self._group_cache: dict = {"ids": [], "at": 0.0}  # {ids, monotonic timestamp}
         self._refresh_after_id = None
         self._subscriptions: list = []        # raw dicts from az account list
         self._sub_display_map: dict = {}      # display label -> sub dict
@@ -792,7 +806,18 @@ class PimApp:
         ctk.CTkLabel(
             actionbar, text="selected",
             text_color=P["text_muted"], font=ctk.CTkFont(size=12),
-        ).pack(side="left", padx=(0, 16))
+        ).pack(side="left", padx=(0, 12))
+
+        self.select_all_btn = ctk.CTkButton(
+            actionbar, text="☑ Select All",
+            width=110, height=38,
+            font=ctk.CTkFont(size=12),
+            fg_color="transparent", border_width=1,
+            border_color=P["border"], text_color=P["text_secondary"],
+            hover_color=P["surface2"],
+            command=self._toggle_select_all,
+        )
+        self.select_all_btn.pack(side="left", padx=(0, 12))
 
         self.activate_btn = ctk.CTkButton(
             actionbar, text="⚡  Activate",
@@ -1017,6 +1042,14 @@ class PimApp:
 
     def _refresh_worker(self):
         try:
+            # One Session for the whole refresh — connection pool is shared across
+            # all parallel requests, eliminating repeated TLS handshakes to ARM/Graph.
+            session = requests.Session()
+            session.mount(
+                "https://",
+                requests.adapters.HTTPAdapter(pool_connections=2, pool_maxsize=10),
+            )
+
             self._update_loading("Acquiring tokens…")
             with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
                 arm_f   = ex.submit(self.credential.get_token, ARM_SCOPE)
@@ -1024,17 +1057,31 @@ class PimApp:
             arm_token   = arm_f.result().token
             graph_token = graph_f.result().token
 
-            self._update_loading("Resolving identity & group memberships…")
-            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
-                user_f  = ex.submit(get_signed_in_user_id, graph_token)
-                group_f = ex.submit(get_my_group_ids, graph_token)
-            user_id   = user_f.result()
-            group_ids = group_f.result()
+            # Group memberships change at most once a day; cache for 15 minutes so
+            # periodic auto-refreshes skip the transitive-memberOf round-trip.
+            now = time.monotonic()
+            cache_valid = (
+                self._group_cache["ids"]
+                and now - self._group_cache["at"] < _GROUP_CACHE_TTL
+            )
+            if cache_valid:
+                self._update_loading("Resolving identity (groups cached)…")
+                user_id   = self.user_id or get_signed_in_user_id(graph_token, session)
+                group_ids = self._group_cache["ids"]
+                log.debug("Using cached group memberships (%d groups)", len(group_ids))
+            else:
+                self._update_loading("Resolving identity & group memberships…")
+                with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
+                    user_f  = ex.submit(get_signed_in_user_id, graph_token, session)
+                    group_f = ex.submit(get_my_group_ids,       graph_token, session)
+                user_id   = user_f.result()
+                group_ids = group_f.result()
+                self._group_cache = {"ids": group_ids, "at": now}
 
             self._update_loading("Loading PIM eligibilities & active assignments…")
             with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
-                elig_f   = ex.submit(list_eligible_roles,     arm_token, group_ids)
-                active_f = ex.submit(list_active_assignments, arm_token, group_ids)
+                elig_f   = ex.submit(list_eligible_roles,     arm_token, group_ids, session)
+                active_f = ex.submit(list_active_assignments, arm_token, group_ids, session)
             eligibilities = elig_f.result()
             actives       = active_f.result()
 
@@ -1252,11 +1299,17 @@ class PimApp:
         self.filter_active_cb.configure(text=f"Active  ({active_n})")
         self.filter_eligible_cb.configure(text=f"Eligible  ({elig_n})")
 
+    def _toggle_select_all(self):
+        eligible = [iid for iid, r in self.row_data.items() if r["status"] == "Eligible"]
+        all_checked = bool(eligible) and all(self.checked.get(iid, False) for iid in eligible)
+        for iid in eligible:
+            self.checked[iid] = not all_checked
+            self.tree.item(iid, values=self._row_values(iid))
+        self._update_selected_label()
+
     def _update_selected_label(self):
-        n = sum(
-            1 for iid, v in self.checked.items()
-            if v and self.row_data.get(iid, {}).get("status") == "Eligible"
-        )
+        eligible = [iid for iid, r in self.row_data.items() if r["status"] == "Eligible"]
+        n = sum(1 for iid in eligible if self.checked.get(iid, False))
         self.selected_lbl.configure(text=str(n))
         P = self._p()
         if n > 0:
@@ -1267,6 +1320,8 @@ class PimApp:
             self.selected_badge.configure(fg_color=P["surface2"])
             self.selected_lbl.configure(text_color=P["text_muted"])
             self.activate_btn.configure(state="disabled")
+        all_checked = bool(eligible) and n == len(eligible)
+        self.select_all_btn.configure(text="☐ Deselect All" if all_checked else "☑ Select All")
 
     # ── Activate ──────────────────────────────────────────────────────────────
 
